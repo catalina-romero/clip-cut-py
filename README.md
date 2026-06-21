@@ -1,4 +1,4 @@
-# Video Clip Extractor Pro 🎮✂️
+# ClipCutPy 🎮✂️
 
 Una aplicación de escritorio para Windows extremadamente ligera y de alto rendimiento, optimizada para extraer clips de video a partir de grabaciones de videojuegos de larga duración (hasta 4 horas o más) de forma instantánea.
 
@@ -28,7 +28,7 @@ video_editor/
 │
 ├── presentation/            # Capa de Presentación (UI y Reproducción nativa)
 │   ├── mpv_player.py        # Adaptador de MPV emparentado a ventana Win32 "STATIC"
-│   └── dpg_app.py           # Interfaz de Dear PyGui, línea de tiempo, zoom y atajos
+│   └── dpg_app.py           # Interfaz de Dear PyGui, línea de tiempo, miniaturas y atajos
 │
 ├── main.py                  # Punto de entrada (Inyección de dependencias y Bootstrap)
 └── libmpv-2.dll             # Biblioteca dinámica oficial de libmpv (Windows x64)
@@ -65,9 +65,8 @@ python main.py
 
 ### 1. Carga de Archivos e Interfaz
 * **Panel Izquierdo:** Visualizador de video nativo integrado. Carga un video desde **Archivo > Abrir Video...**.
-* **Línea de Tiempo Inferior:** Permite arrastrar el cabezal de reproducción.
-* **Zoom Temporal (Slider):** "Amplía" la escala temporal de la barra de reproducción (hasta enfocar un rango de 15 segundos) para seleccionar momentos con precisión de milisegundos en archivos muy extensos.
-* **Panel Derecho (Gestor de Clips):** Contiene la lista de clips creados en la sesión.
+* **Línea de Tiempo Inferior:** Permite arrastrar el cabezal de reproducción y muestra una tira de miniaturas en segundo plano para ubicar fácilmente los momentos clave del video.
+* **Panel Derecho (Gestor de Clips):** Contiene la lista de clips creados en la sesión con sus respectivas miniaturas.
   * *Click Izquierdo:* Salta instantáneamente al segundo de inicio del clip para previsualizarlo.
   * *Click Derecho:* Abre el menú contextual para:
     * **Exportar este clip...**: Abre el diálogo nativo para seleccionar la ruta y exportarlo con FFmpeg de inmediato.
@@ -79,6 +78,8 @@ python main.py
 * `[←] / [→]` (Flechas): Retroceder o avanzar el video exactamente 1 segundo.
 * `[I]`: Fijar marcador de **Inicio** del fragmento.
 * `[O]`: Fijar marcador de **Fin** del fragmento.
+* `[Enter]` o `[A]`: Guardar el fragmento actual como clip y agregarlo a la lista de clips.
+* `[Esc]` o `[D]`: Descartar la selección actual y limpiar los marcadores de inicio y fin.
 
 ### 3. Persistencia Ligera
 Puedes guardar tu sesión de trabajo actual y recargarla más tarde desde el menú:
