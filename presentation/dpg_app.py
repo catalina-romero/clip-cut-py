@@ -1,6 +1,8 @@
 import os
 import sys
 import time
+import subprocess
+import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from typing import Optional, List, Tuple
@@ -36,10 +38,30 @@ class VideoEditorApp:
         self.clip_end: Optional[float] = None
         self.dragging_slider = False
         self.target_delete_clip: Optional[Clip] = None
+        
+        # Bandera lógica para bloquear atajos cuando hay un diálogo emergente
+        self.modal_active = False
+
+        # Carpetas y colas de carga asíncrona para miniaturas
+        root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.temp_thumbs_dir = os.path.join(root_dir, "temp_thumbs")
+        self.thumbs_to_load: List[Tuple[str, int]] = []
+        self.clip_thumbs_to_load: List[Tuple[str, str]] = []
+
+        # Inicializar y limpiar directorio temporal de miniaturas
+        if not os.path.exists(self.temp_thumbs_dir):
+            os.makedirs(self.temp_thumbs_dir, exist_ok=True)
+        else:
+            # Limpiar anteriores
+            for f in os.listdir(self.temp_thumbs_dir):
+                try:
+                    os.remove(os.path.join(self.temp_thumbs_dir, f))
+                except Exception:
+                    pass
 
     def run(self):
         dpg.create_context()
-        dpg.create_viewport(title="Video Clip Extractor Pro", width=1280, height=720, min_width=800, min_height=600)
+        dpg.create_viewport(title="ClipCutPy", width=1280, height=720, min_width=800, min_height=600)
         dpg.setup_dearpygui()
 
         self._build_theme()
@@ -48,10 +70,14 @@ class VideoEditorApp:
 
         # Obtener HWND nativo del viewport principal para emparentar MPV
         import win32gui
-        hwnd = win32gui.FindWindow(None, "Video Clip Extractor Pro")
+        hwnd = win32gui.FindWindow(None, "ClipCutPy")
         if hwnd:
             # Inicializar el reproductor MPV incrustado
-            self.player.embed_in_window(hwnd, 10, 40, 800, 450)
+            self.player.embed_in_window(hwnd, 10, 35, 800, 350)
+            
+            # Deshabilitar ventana de MPV en Win32 para que no robe el foco del teclado
+            win32gui.EnableWindow(self.player.child_hwnd, False)
+
             # Configurar callbacks del reproductor
             self.player.set_on_time_change_callback(self._on_time_change_from_mpv)
             self.player.set_on_video_loaded_callback(self._on_video_loaded_from_mpv)
@@ -75,13 +101,51 @@ class VideoEditorApp:
 
     def _main_loop(self):
         """Bucle principal de ejecución a 60 FPS estables."""
-        last_time = time.time()
         while dpg.is_dearpygui_running():
-            now = time.time()
+            # Detectar teclas espacio y flechas de forma directa y global para evitar que
+            # Dear PyGui las devore cuando hay widgets enfocados
+            if not self.modal_active and self.proyecto.video:
+                if dpg.is_key_pressed(dpg.mvKey_Spacebar):
+                    self._btn_toggle_play()
+                elif dpg.is_key_pressed(dpg.mvKey_Left):
+                    self._seek_relative(-1.0)
+                elif dpg.is_key_pressed(dpg.mvKey_Right):
+                    self._seek_relative(1.0)
+
             # Si el video se está reproduciendo, actualizamos la posición del slider desde la posición del reproductor
             if self.proyecto.video and self.player.is_playing() and not self.dragging_slider:
                 self.current_time = self.player.get_current_time()
                 self._update_timeline_ui()
+
+            # Cargar texturas de la tira de la línea de tiempo cargadas de forma asíncrona
+            if self.thumbs_to_load:
+                thumb_path, idx = self.thumbs_to_load.pop(0)
+                try:
+                    width, height, channels, data = dpg.load_image(thumb_path)
+                    tex_tag = f"timeline_thumb_tex_{idx}"
+                    if dpg.does_item_exist(tex_tag):
+                        dpg.delete_item(tex_tag)
+                    with dpg.texture_registry():
+                        dpg.add_static_texture(width=width, height=height, default_value=data, tag=tex_tag)
+                    if dpg.does_item_exist(f"timeline_thumb_img_{idx}"):
+                        dpg.configure_item(f"timeline_thumb_img_{idx}", texture_tag=tex_tag)
+                except Exception as e:
+                    print(f"Error al cargar textura de miniatura temporal: {e}")
+
+            # Cargar texturas de miniaturas de clips cargados de forma asíncrona
+            if self.clip_thumbs_to_load:
+                clip_id, thumb_path = self.clip_thumbs_to_load.pop(0)
+                try:
+                    width, height, channels, data = dpg.load_image(thumb_path)
+                    tex_tag = f"clip_thumb_tex_{clip_id}"
+                    if dpg.does_item_exist(tex_tag):
+                        dpg.delete_item(tex_tag)
+                    with dpg.texture_registry():
+                        dpg.add_static_texture(width=width, height=height, default_value=data, tag=tex_tag)
+                    # Reconstruir la lista para mostrar la imagen recién cargada
+                    self._rebuild_clip_list_ui()
+                except Exception as e:
+                    print(f"Error al cargar textura de clip temporal: {e}")
 
             dpg.render_dearpygui_frame()
 
@@ -99,6 +163,16 @@ class VideoEditorApp:
         self.clip_start = None
         self.clip_end = None
         
+        # Poner todas las miniaturas de la línea de tiempo en placeholder mientras se extraen
+        for i in range(8):
+            if dpg.does_item_exist(f"timeline_thumb_img_{i}"):
+                dpg.configure_item(f"timeline_thumb_img_{i}", texture_tag="placeholder_texture")
+
+        # Lanzar la extracción asíncrona de miniaturas en la línea de tiempo
+        if self.proyecto.video:
+            t = threading.Thread(target=self._generate_timeline_thumbnails, args=(self.proyecto.video.filepath,), daemon=True)
+            t.start()
+
         # Actualizar UI en el hilo principal
         self._update_timeline_ui()
         self._draw_timeline_visuals()
@@ -109,7 +183,7 @@ class VideoEditorApp:
         vh = dpg.get_viewport_height()
 
         padding = 10
-        top_y = 35  # Espacio para el menú principal
+        top_y = 30  # Espacio para el menú principal plano
 
         # Panel izquierdo (Video + Controles): 72% de ancho
         left_w = int(vw * 0.72) - padding * 2
@@ -119,19 +193,32 @@ class VideoEditorApp:
         # Altura disponible total
         total_h = vh - top_y - padding * 4
 
-        # El video ocupa el 70% del panel izquierdo
-        video_h = int(total_h * 0.70)
-        # Los controles ocupan el resto del panel izquierdo
-        controls_h = total_h - video_h - padding
+        # Altura fija para la caja de controles al fondo (no escroleable) para acomodar todos los controles sin aplastarlos
+        controls_h = 150
+        
+        # El video ocupa el espacio restante en el medio (se elimina cabecera redundante)
+        video_h = total_h - controls_h - padding
+        video_h = max(200, video_h) # Altura mínima segura
 
         # Ajustar dimensiones de contenedores en Dear PyGui
-        dpg.configure_item("video_container", width=left_w, height=video_h)
+        # Video arriba
+        dpg.configure_item("video_container", pos=(padding, top_y), width=left_w, height=video_h)
+        # Controles abajo
         dpg.configure_item("controls_container", pos=(padding, top_y + video_h + padding), width=left_w, height=controls_h)
+        # Clips a la derecha ocupando toda la altura
         dpg.configure_item("clips_container", pos=(padding + left_w + padding, top_y), width=right_w, height=total_h)
 
         # Ajustar tamaño de subventana de MPV (con offsets para conservar el borde del contenedor DPG)
         if self.player:
             self.player.resize_window(padding + 8, top_y + 8, left_w - 16, video_h - 16)
+
+        # Ajustar tamaño de miniaturas de la línea de tiempo de forma adaptativa
+        thumb_w = int(left_w / 8.0) - 4
+        thumb_h = int(thumb_w * 9 / 16)
+        thumb_h = min(35, thumb_h)
+        for i in range(8):
+            if dpg.does_item_exist(f"timeline_thumb_img_{i}"):
+                dpg.configure_item(f"timeline_thumb_img_{i}", width=thumb_w, height=thumb_h)
 
         # Redibujar la barra visual de la línea de tiempo
         self._draw_timeline_visuals()
@@ -141,31 +228,26 @@ class VideoEditorApp:
         with dpg.theme() as global_theme:
             with dpg.theme_component(dpg.mvAll):
                 # Colores de ventanas y paneles
-                dpg.add_theme_color(dpg.mvThemeCol_WindowBg, (15, 15, 15))
-                dpg.add_theme_color(dpg.mvThemeCol_ChildBg, (22, 22, 22))
-                dpg.add_theme_color(dpg.mvThemeCol_Border, (38, 38, 38))
+                dpg.add_theme_color(dpg.mvThemeCol_WindowBg, (12, 12, 12))
+                dpg.add_theme_color(dpg.mvThemeCol_ChildBg, (20, 20, 20))
+                dpg.add_theme_color(dpg.mvThemeCol_Border, (32, 32, 32))
                 
                 # Colores de campos de entrada y sliders
-                dpg.add_theme_color(dpg.mvThemeCol_FrameBg, (30, 30, 30))
-                dpg.add_theme_color(dpg.mvThemeCol_FrameBgHovered, (40, 40, 40))
-                dpg.add_theme_color(dpg.mvThemeCol_FrameBgActive, (50, 50, 50))
-                
-                # Botones genéricos (Gris Carbón)
-                dpg.add_theme_color(dpg.mvThemeCol_Button, (40, 40, 40))
-                dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (60, 60, 60))
-                dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (80, 80, 80))
+                dpg.add_theme_color(dpg.mvThemeCol_FrameBg, (26, 26, 26))
+                dpg.add_theme_color(dpg.mvThemeCol_FrameBgHovered, (36, 36, 36))
+                dpg.add_theme_color(dpg.mvThemeCol_FrameBgActive, (46, 46, 46))
 
-                # Selección
-                dpg.add_theme_color(dpg.mvThemeCol_Header, (55, 65, 80))
-                dpg.add_theme_color(dpg.mvThemeCol_HeaderHovered, (70, 80, 100))
-                dpg.add_theme_color(dpg.mvThemeCol_HeaderActive, (80, 95, 120))
+                # Selección y Resaltados
+                dpg.add_theme_color(dpg.mvThemeCol_Header, (45, 52, 64))
+                dpg.add_theme_color(dpg.mvThemeCol_HeaderHovered, (60, 70, 85))
+                dpg.add_theme_color(dpg.mvThemeCol_HeaderActive, (70, 85, 105))
                 
-                # Deslizadores (Verde Esmeralda)
+                # Deslizador Principal
                 dpg.add_theme_color(dpg.mvThemeCol_SliderGrab, (46, 204, 113))
                 dpg.add_theme_color(dpg.mvThemeCol_SliderGrabActive, (39, 174, 96))
 
-                # Estilos visuales
-                dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 5)
+                # Estilos visuales redondeados premium
+                dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 6)
                 dpg.add_theme_style(dpg.mvStyleVar_WindowRounding, 8)
                 dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, 8)
                 dpg.add_theme_style(dpg.mvStyleVar_GrabRounding, 4)
@@ -173,126 +255,119 @@ class VideoEditorApp:
 
         dpg.bind_theme(global_theme)
 
+        # Generador de temas para botones individuales de estética premium
+        def create_button_theme(color, hover_color, active_color):
+            with dpg.theme() as theme:
+                with dpg.theme_component(dpg.mvButton):
+                    dpg.add_theme_color(dpg.mvThemeCol_Button, color)
+                    dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, hover_color)
+                    dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, active_color)
+                    dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 6)
+                    dpg.add_theme_style(dpg.mvStyleVar_ButtonTextAlign, 0.5, 0.5)
+            return theme
+
+        # Paleta de Colores de Botones Premium
+        self.play_btn_theme = create_button_theme((41, 128, 185), (52, 152, 219), (31, 97, 141))       # Azul
+        self.start_btn_theme = create_button_theme((39, 174, 96), (46, 204, 113), (30, 130, 70))      # Verde
+        self.end_btn_theme = create_button_theme((192, 57, 43), (231, 76, 60), (150, 40, 30))        # Rojo
+        self.discard_btn_theme = create_button_theme((127, 140, 141), (149, 165, 166), (95, 109, 110)) # Gris
+        self.add_btn_theme = create_button_theme((142, 68, 173), (155, 89, 182), (108, 52, 137))      # Morado
+        self.export_all_btn_theme = create_button_theme((211, 84, 0), (230, 126, 34), (160, 60, 0))   # Naranja/Oro
+
     def _build_ui(self):
         """Define la estructura visual y controles de la aplicación."""
-        # Menú Superior
-        with dpg.viewport_menu_bar():
-            with dpg.menu(label="Archivo"):
-                dpg.add_menu_item(label="Abrir Video...", callback=self._menu_abrir_video)
-                dpg.add_menu_item(label="Cargar Proyecto JSON...", callback=self._menu_cargar_proyecto)
-                dpg.add_menu_item(label="Guardar Proyecto JSON...", callback=self._menu_guardar_proyecto)
-                dpg.add_menu_item(label="Salir", callback=lambda: sys.exit(0))
+        # Textura por defecto para placeholders de miniaturas
+        placeholder_data = [0.1, 0.1, 0.1, 1.0] * (160 * 90) # Gris oscuro
+        with dpg.texture_registry():
+            dpg.add_static_texture(width=160, height=90, default_value=placeholder_data, tag="placeholder_texture")
 
-        # Ventana Principal Invisible (Actúa como root de los paneles flotantes anclados por pos)
-        with dpg.window(tag="primary_window", no_title_bar=True, no_resize=True, no_move=True):
+        # Menú Superior Plano sin submenús (Resuelve el bug de ocultamiento por Z-Order)
+        with dpg.viewport_menu_bar():
+            dpg.add_menu_item(label="Abrir Video", callback=self._menu_abrir_video)
+            dpg.add_menu_item(label="Cargar Proyecto", callback=self._menu_cargar_proyecto)
+            dpg.add_menu_item(label="Guardar Proyecto", callback=self._menu_guardar_proyecto)
+            dpg.add_menu_item(label="Salir", callback=lambda: sys.exit(0))
+
+        # Ventana Principal Invisible
+        with dpg.window(tag="primary_window", no_title_bar=True, no_resize=True, no_move=True, no_scrollbar=True):
             dpg.set_primary_window("primary_window", True)
 
-            # 1. Panel Contenedor de Video
-            with dpg.child_window(tag="video_container", pos=(10, 35)):
-                # Se dibuja un fondo negro para simular el reproductor cuando no hay video cargado
-                dpg.add_text("Abra un archivo de video desde el menú Archivo para comenzar.", tag="placeholder_text", pos=(30, 30), color=(180, 180, 180))
+            # 1. Panel Contenedor de Video (Arriba)
+            with dpg.child_window(tag="video_container", pos=(10, 30)):
+                dpg.add_text("Abra un archivo de video para comenzar.", tag="placeholder_text", pos=(30, 30), color=(180, 180, 180))
 
-            # 2. Panel de Controles Inferior
-            with dpg.child_window(tag="controls_container", pos=(10, 500)):
-                # Línea de estado temporal superior
+            # 2. Panel de Controles Inferior (Debajo del video, estático sin scroll)
+            with dpg.child_window(tag="controls_container", pos=(10, 390), no_scrollbar=True):
+                # Tira de miniaturas de la línea de tiempo (Filmstrip)
+                with dpg.group(horizontal=True, tag="timeline_thumbs_container"):
+                    for i in range(8):
+                        dpg.add_image("placeholder_texture", tag=f"timeline_thumb_img_{i}", width=100, height=56)
+
+                # Slider de Línea de Tiempo Principal y Tiempos en la misma línea para ahorrar espacio
                 with dpg.group(horizontal=True):
-                    dpg.add_text("Tiempo:", color=(150, 150, 150))
+                    dpg.add_slider_double(
+                        label="",
+                        tag="timeline_slider",
+                        min_value=0.0,
+                        max_value=1.0,
+                        default_value=0.0,
+                        width=-420,
+                        callback=self._on_timeline_slider_change,
+                        user_data="drag"
+                    )
                     dpg.add_text("00:00:00.000 / 00:00:00.000", tag="time_text", color=(255, 255, 255))
-                    dpg.add_spacer(width=20)
-                    dpg.add_text("Inicio:", color=(150, 150, 150))
+                    dpg.add_spacer(width=10)
+                    dpg.add_text("In:", color=(150, 150, 150))
                     dpg.add_text("No fijado", tag="start_marker_text", color=(46, 204, 113))
                     dpg.add_spacer(width=10)
-                    dpg.add_text("Fin:", color=(150, 150, 150))
+                    dpg.add_text("Out:", color=(150, 150, 150))
                     dpg.add_text("No fijado", tag="end_marker_text", color=(231, 76, 60))
 
                 # Canvas de visualización de Marcadores
                 with dpg.group():
-                    dpg.add_drawlist(width=1, height=18, tag="timeline_drawlist")
+                    dpg.add_drawlist(width=1, height=12, tag="timeline_drawlist")
 
-                # Slider de Línea de Tiempo Principal
-                dpg.add_slider_double(
-                    label="",
-                    tag="timeline_slider",
-                    min_value=0.0,
-                    max_value=1.0,
-                    default_value=0.0,
-                    width=-1,
-                    callback=self._on_timeline_slider_change,
-                    user_data="drag"
-                )
-
-                # Slider de Zoom Dedicado
-                with dpg.group(horizontal=True):
-                    dpg.add_text("Zoom Temporal:", color=(180, 180, 180))
-                    dpg.add_slider_double(
-                        label="x (Ampliar detalles)",
-                        tag="zoom_slider",
-                        min_value=1.0,
-                        max_value=100.0,
-                        default_value=1.0,
-                        width=250,
-                        callback=self._on_zoom_change
-                    )
-
-                dpg.add_spacer(height=5)
-
-                # Fila de Botones Digitales
+                # Fila de Botones Digitales con Estética Premium
                 with dpg.group(horizontal=True):
                     # Reproducir/Pausar
                     dpg.add_button(label="Reproducir/Pausar", callback=self._btn_toggle_play, width=130)
-                    dpg.add_spacer(width=10)
-
-                    # Fijar Inicio (Verde)
-                    with dpg.theme() as green_btn_theme:
-                        with dpg.theme_component(dpg.mvButton):
-                            dpg.add_theme_color(dpg.mvThemeCol_Button, (39, 174, 96))
-                            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (46, 204, 113))
-                            dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (30, 130, 70))
-                    dpg.add_button(label="Fijar Inicio [I]", callback=self._btn_mark_start, width=120)
-                    dpg.bind_item_theme(dpg.last_item(), green_btn_theme)
-
-                    # Fijar Fin (Rojo)
-                    with dpg.theme() as red_btn_theme:
-                        with dpg.theme_component(dpg.mvButton):
-                            dpg.add_theme_color(dpg.mvThemeCol_Button, (192, 57, 43))
-                            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (231, 76, 60))
-                            dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (150, 40, 30))
-                    dpg.add_button(label="Fijar Fin [O]", callback=self._btn_mark_end, width=120)
-                    dpg.bind_item_theme(dpg.last_item(), red_btn_theme)
-
-                    dpg.add_spacer(width=10)
-                    # Descartar
-                    dpg.add_button(label="Descartar Selección", callback=self._btn_clear_markers, width=140)
+                    dpg.bind_item_theme(dpg.last_item(), self.play_btn_theme)
                     
-                    # Añadir Clip (Azul)
-                    with dpg.theme() as blue_btn_theme:
-                        with dpg.theme_component(dpg.mvButton):
-                            dpg.add_theme_color(dpg.mvThemeCol_Button, (41, 128, 185))
-                            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (52, 152, 219))
-                            dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (30, 100, 150))
-                    dpg.add_button(label="Añadir a la Lista", callback=self._btn_add_clip, width=130)
-                    dpg.bind_item_theme(dpg.last_item(), blue_btn_theme)
+                    dpg.add_spacer(width=5)
 
-                dpg.add_spacer(height=8)
+                    # Fijar Inicio [I]
+                    dpg.add_button(label="Fijar Inicio [I]", callback=self._btn_mark_start, width=120)
+                    dpg.bind_item_theme(dpg.last_item(), self.start_btn_theme)
+
+                    # Fijar Fin [O]
+                    dpg.add_button(label="Fijar Fin [O]", callback=self._btn_mark_end, width=120)
+                    dpg.bind_item_theme(dpg.last_item(), self.end_btn_theme)
+
+                    dpg.add_spacer(width=5)
+                    
+                    # Descartar
+                    dpg.add_button(label="Descartar Selección [Esc]", callback=self._btn_clear_markers, width=160)
+                    dpg.bind_item_theme(dpg.last_item(), self.discard_btn_theme)
+                    
+                    # Añadir Clip
+                    dpg.add_button(label="Añadir a la Lista [Enter]", callback=self._btn_add_clip, width=160)
+                    dpg.bind_item_theme(dpg.last_item(), self.add_btn_theme)
+
+                dpg.add_spacer(height=3)
                 # Leyenda de Atajos
-                dpg.add_text("Atajos: [Espacio] Play/Pause | [Flecha Izquierda/Derecha] +-1 Segundo | [I] Fijar Inicio | [O] Fijar Fin", color=(100, 100, 100))
+                dpg.add_text("Atajos: [Espacio] Play/Pause | [←] / [→] +-1s | [I] Inicio | [O] Fin | [Enter] Guardar | [Esc] Descartar", color=(90, 90, 90))
 
             # 3. Panel de Gestor de Clips (Derecho)
-            with dpg.child_window(tag="clips_container", pos=(930, 35)):
+            with dpg.child_window(tag="clips_container", pos=(930, 30), no_scrollbar=True):
                 # Botón Exportar Todo Destacado
-                with dpg.theme() as gold_btn_theme:
-                    with dpg.theme_component(dpg.mvButton):
-                        dpg.add_theme_color(dpg.mvThemeCol_Button, (230, 126, 34))
-                        dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (243, 156, 18))
-                        dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (180, 90, 20))
                 dpg.add_button(label="EXPORTAR TODOS LOS CLIPS", callback=self._btn_exportar_todos, width=-1, height=40)
-                dpg.bind_item_theme(dpg.last_item(), gold_btn_theme)
+                dpg.bind_item_theme(dpg.last_item(), self.export_all_btn_theme)
 
                 dpg.add_separator()
                 dpg.add_text("Clips de la Sesión:", color=(160, 160, 160))
                 
                 # Lista interna scrolleable
-                with dpg.child_window(tag="clip_list_window", width=-1, height=-60, border=False):
+                with dpg.child_window(tag="clip_list_window", width=-1, height=-65, border=False):
                     dpg.add_text("No hay clips creados.", tag="no_clips_text", color=(100, 100, 100))
 
                 # Barra de estado inferior en el panel de clips
@@ -306,7 +381,7 @@ class VideoEditorApp:
             dpg.add_spacer(height=10)
             with dpg.group(horizontal=True):
                 dpg.add_button(label="Sí, eliminar", callback=self._modal_confirm_delete_yes, width=120)
-                dpg.add_button(label="Cancelar", callback=lambda: dpg.configure_item("confirm_delete_modal", show=False), width=120)
+                dpg.add_button(label="Cancelar", callback=lambda: self._close_delete_modal(), width=120)
 
         # Modal de Progreso para Exportación en Lote
         with dpg.window(label="Exportando Clips...", modal=True, show=False, id="progress_modal", no_resize=True, no_move=True, no_close=True):
@@ -314,31 +389,15 @@ class VideoEditorApp:
             dpg.add_spacer(height=10)
             dpg.add_progress_bar(tag="progress_modal_bar", width=300, default_value=0.0)
 
-    # --- Lógica de Timeline y Zoom ---
+    # --- Lógica de Timeline ---
 
     def _update_timeline_ui(self):
         """Actualiza el valor, los límites y el formato digital del slider de tiempo."""
         if self.total_duration <= 0.0:
             return
 
-        zoom = dpg.get_value("zoom_slider")
-        if zoom <= 1.0:
-            min_val = 0.0
-            max_val = self.total_duration
-        else:
-            # Ventana dinámica en segundos. A zoom máximo (100x), se enfoca en una ventana de 15 segundos.
-            min_window = 15.0
-            window_size = min_window + (self.total_duration - min_window) * (1.0 - (zoom - 1.0) / 99.0)
-            window_size = max(min_window, min(self.total_duration, window_size))
-
-            # Centrar la ventana de visualización en la posición actual
-            min_val = self.current_time - window_size / 2.0
-            if min_val < 0.0:
-                min_val = 0.0
-            max_val = min_val + window_size
-            if max_val > self.total_duration:
-                max_val = self.total_duration
-                min_val = max(0.0, max_val - window_size)
+        min_val = 0.0
+        max_val = self.total_duration
 
         # Configurar límites del slider
         dpg.configure_item("timeline_slider", min_value=min_val, max_value=max_val)
@@ -365,9 +424,8 @@ class VideoEditorApp:
         dpg.configure_item(canvas_tag, width=canvas_width)
         dpg.delete_item(canvas_tag, children_only=True)
 
-        # Obtener el rango visible actual del slider
-        min_val = dpg.get_item_configuration("timeline_slider")["min_value"]
-        max_val = dpg.get_item_configuration("timeline_slider")["max_value"]
+        min_val = 0.0
+        max_val = self.total_duration
         span = max_val - min_val
         if span <= 0:
             return
@@ -377,35 +435,34 @@ class VideoEditorApp:
             return ((t - min_val) / span) * canvas_width
 
         # 1. Dibujar fondo de la barra
-        dpg.draw_rectangle([0, 2], [canvas_width, 16], color=(50, 50, 50), fill=(28, 28, 28), parent=canvas_tag)
+        dpg.draw_rectangle([0, 2], [canvas_width, 10], color=(50, 50, 50), fill=(28, 28, 28), parent=canvas_tag)
 
         # 2. Dibujar zona de selección si ambos marcadores están puestos
         if self.clip_start is not None and self.clip_end is not None:
             px_start = to_pixel(self.clip_start)
             px_end = to_pixel(self.clip_end)
-            # Acotar coordenadas al rango visible del canvas
             c_start = max(0.0, min(canvas_width, px_start))
             c_end = max(0.0, min(canvas_width, px_end))
             if c_start < c_end:
                 # Rectángulo translúcido verde esmeralda
-                dpg.draw_rectangle([c_start, 2], [c_end, 16], color=(46, 204, 113, 200), fill=(46, 204, 113, 40), parent=canvas_tag)
+                dpg.draw_rectangle([c_start, 2], [c_end, 10], color=(46, 204, 113, 200), fill=(46, 204, 113, 40), parent=canvas_tag)
 
         # 3. Dibujar marcador de Inicio (Línea vertical verde)
         if self.clip_start is not None:
             px = to_pixel(self.clip_start)
             if 0.0 <= px <= canvas_width:
-                dpg.draw_line([px, 0], [px, 18], color=(46, 204, 113), thickness=2, parent=canvas_tag)
+                dpg.draw_line([px, 0], [px, 12], color=(46, 204, 113), thickness=2, parent=canvas_tag)
 
         # 4. Dibujar de Fin (Línea vertical roja)
         if self.clip_end is not None:
             px = to_pixel(self.clip_end)
             if 0.0 <= px <= canvas_width:
-                dpg.draw_line([px, 0], [px, 18], color=(231, 76, 60), thickness=2, parent=canvas_tag)
+                dpg.draw_line([px, 0], [px, 12], color=(231, 76, 60), thickness=2, parent=canvas_tag)
 
         # 5. Dibujar cursor de reproducción (Línea vertical blanca)
         px_curr = to_pixel(self.current_time)
         if 0.0 <= px_curr <= canvas_width:
-            dpg.draw_line([px_curr, 0], [px_curr, 18], color=(255, 255, 255), thickness=2, parent=canvas_tag)
+            dpg.draw_line([px_curr, 0], [px_curr, 12], color=(255, 255, 255), thickness=2, parent=canvas_tag)
 
     def _on_timeline_slider_change(self):
         """Acción cuando el usuario desliza la línea de tiempo."""
@@ -415,10 +472,7 @@ class VideoEditorApp:
         self.player.seek(new_time)
         self.dragging_slider = False
         self._update_timeline_ui()
-
-    def _on_zoom_change(self):
-        """Acción cuando se modifica el factor de zoom."""
-        self._update_timeline_ui()
+        dpg.focus_item("primary_window")
 
     # --- Gestión de Atajos y Botones de Reproducción ---
 
@@ -429,20 +483,30 @@ class VideoEditorApp:
 
     def _on_key_press(self, sender, app_data):
         key = app_data
-        # Ignorar atajos si el usuario está interactuando con modales o cuadros de entrada activos
-        if dpg.is_any_item_active():
+        
+        # Ignorar atajos si hay algún cuadro de diálogo o confirmación modal activo
+        if self.modal_active:
             return
 
-        if key == dpg.mvKey_Spacebar:
-            self._btn_toggle_play()
-        elif key == dpg.mvKey_I:
+        # Teclas mapeadas por su código virtual nativo (Windows) y constantes de Dear PyGui
+        # Nota: Espacio y Flechas se gestionan en el bucle principal (_main_loop) usando
+        # dpg.is_key_pressed para evitar conflictos de foco con sliders y botones.
+            
+        # 1. Fijar marcador de Inicio: I / i (73, 105, dpg.mvKey_I)
+        if key == 73 or key == 105 or key == dpg.mvKey_I:
             self._btn_mark_start()
-        elif key == dpg.mvKey_O:
+            
+        # 2. Fijar marcador de Fin: O / o (79, 111, dpg.mvKey_O)
+        elif key == 79 or key == 111 or key == dpg.mvKey_O:
             self._btn_mark_end()
-        elif key == dpg.mvKey_Left:
-            self._seek_relative(-1.0)
-        elif key == dpg.mvKey_Right:
-            self._seek_relative(1.0)
+            
+        # 3. Añadir clip a la lista: Enter (13), A / a (65, 97, dpg.mvKey_Return, dpg.mvKey_A)
+        elif key == 13 or key == 65 or key == 97 or key == dpg.mvKey_Return or key == dpg.mvKey_A:
+            self._btn_add_clip()
+            
+        # 4. Descartar selección: Escape (27), D / d (68, 100, dpg.mvKey_Escape, dpg.mvKey_D)
+        elif key == 27 or key == 68 or key == 100 or key == dpg.mvKey_Escape or key == dpg.mvKey_D:
+            self._btn_clear_markers()
 
     def _seek_relative(self, offset: float):
         """Avanza o retrocede de forma relativa en el video."""
@@ -462,6 +526,7 @@ class VideoEditorApp:
         else:
             self.player.play()
             dpg.set_value("status_bar", "Reproduciendo...")
+        dpg.focus_item("primary_window")
 
     def _btn_mark_start(self):
         if not self.proyecto.video:
@@ -469,6 +534,7 @@ class VideoEditorApp:
         self.clip_start = self.current_time
         dpg.set_value("start_marker_text", self._format_time(self.clip_start))
         self._update_timeline_ui()
+        dpg.focus_item("primary_window")
 
     def _btn_mark_end(self):
         if not self.proyecto.video:
@@ -476,6 +542,7 @@ class VideoEditorApp:
         self.clip_end = self.current_time
         dpg.set_value("end_marker_text", self._format_time(self.clip_end))
         self._update_timeline_ui()
+        dpg.focus_item("primary_window")
 
     def _btn_clear_markers(self):
         self.clip_start = None
@@ -483,6 +550,7 @@ class VideoEditorApp:
         dpg.set_value("start_marker_text", "No fijado")
         dpg.set_value("end_marker_text", "No fijado")
         self._update_timeline_ui()
+        dpg.focus_item("primary_window")
 
     # --- Gestión de Clips de Sesión ---
 
@@ -496,20 +564,34 @@ class VideoEditorApp:
             return
 
         try:
+            # Obtener el nombre del video original sin extensión como prefijo para los clips
+            video_basename = os.path.basename(self.proyecto.video.filepath)
+            video_name, _ = os.path.splitext(video_basename)
+            # Sanitizar nombre (reemplazar caracteres que no sean alfanuméricos por guion bajo)
+            clean_prefix = "".join(c if c.isalnum() or c in ('-', '_') else '_' for c in video_name)
+            while '__' in clean_prefix:
+                clean_prefix = clean_prefix.replace('__', '_')
+            clean_prefix = clean_prefix.strip('_')
+
             nuevo_clip = self.agregar_clip_uc.ejecutar(
                 proyecto=self.proyecto,
                 start_seconds=self.clip_start,
                 end_seconds=self.clip_end,
-                name_prefix="clip_partida"
+                name_prefix=clean_prefix
             )
             dpg.set_value("status_bar", f"Añadido: {nuevo_clip.name}")
+            
+            # Lanzar extracción asíncrona de la miniatura para el listado de clips
+            t = threading.Thread(target=self._generate_clip_thumbnail, args=(nuevo_clip,), daemon=True)
+            t.start()
+
             self._btn_clear_markers()
             self._rebuild_clip_list_ui()
         except Exception as e:
             self._show_error(f"Error al añadir clip: {str(e)}")
 
     def _rebuild_clip_list_ui(self):
-        """Redibuja de forma dinámica el listado vertical en el Panel Derecho."""
+        """Redibuja de forma dinámica el listado vertical en el Panel Derecho con miniaturas y manejadores de click."""
         dpg.delete_item("clip_list_window", children_only=True)
 
         if not self.proyecto.clips:
@@ -518,18 +600,41 @@ class VideoEditorApp:
 
         for clip in self.proyecto.clips:
             clip_tag = f"clip_item_{clip.id}"
+            row_tag = f"clip_row_{clip.id}"
+            tex_tag = f"clip_thumb_tex_{clip.id}"
+            
+            has_tex = dpg.does_item_exist(tex_tag)
             
             with dpg.group(parent="clip_list_window", tag=clip_tag):
-                # Elemento seleccionable que al hacer click salta al inicio del fragmento
-                dpg.add_selectable(
-                    label=f"{clip.name} ({self._format_time(clip.duration)})",
-                    callback=self._on_clip_item_left_click,
-                    user_data=clip,
-                    width=-1
-                )
+                with dpg.group(horizontal=True, tag=row_tag):
+                    # Dibujar miniatura (o placeholder si aún se está extrayendo)
+                    img_item = dpg.add_image(tex_tag if has_tex else "placeholder_texture", width=80, height=45)
+                    
+                    with dpg.group() as text_group:
+                        title_item = dpg.add_text(clip.name, color=(255, 255, 255))
+                        dur_item = dpg.add_text(f"Duración: {self._format_time(clip.duration)}", color=(150, 150, 150))
+
+                dpg.add_spacer(height=3)
+                dpg.add_separator()
+                dpg.add_spacer(height=3)
+
+                # Registro de gestor de click izquierdo (Seek instantáneo)
+                handler_tag = f"clip_handler_{clip.id}"
+                if dpg.does_item_exist(handler_tag):
+                    dpg.delete_item(handler_tag)
+                    
+                with dpg.item_handler_registry(tag=handler_tag):
+                    dpg.add_item_clicked_handler(button=dpg.mvMouseButton_Left, callback=self._on_clip_item_left_click, user_data=clip)
                 
-                # Crear menú contextual de click derecho
-                with dpg.popup(parent=dpg.last_item(), mousebutton=dpg.mvMouseButton_Right):
+                # Vincular el handler a todos los elementos del renglón para que sea súper clickeable
+                dpg.bind_item_handler_registry(row_tag, handler_tag)
+                dpg.bind_item_handler_registry(img_item, handler_tag)
+                dpg.bind_item_handler_registry(title_item, handler_tag)
+                dpg.bind_item_handler_registry(dur_item, handler_tag)
+                dpg.bind_item_handler_registry(text_group, handler_tag)
+
+                # Crear menú contextual de click derecho (vincular a la fila principal)
+                with dpg.popup(parent=row_tag, mousebutton=dpg.mvMouseButton_Right):
                     dpg.add_menu_item(label="Exportar este clip...", callback=self._menu_exportar_clip_individual, user_data=clip)
                     dpg.add_menu_item(label="Eliminar clip", callback=self._menu_confirmar_eliminar_clip, user_data=clip)
 
@@ -541,18 +646,38 @@ class VideoEditorApp:
         self.player.pause()  # pausar para previsualizar el frame de inicio
         self._update_timeline_ui()
         dpg.set_value("status_bar", f"Previsualizando {clip.name}")
+        dpg.focus_item("primary_window")
 
     def _menu_confirmar_eliminar_clip(self, sender, app_data, user_data: Clip):
         """Muestra el modal de confirmación antes de remover el clip."""
         self.target_delete_clip = user_data
+        self.modal_active = True
         dpg.set_value("confirm_delete_text", f"¿Está seguro de que desea eliminar '{user_data.name}'?")
         dpg.configure_item("confirm_delete_modal", show=True)
 
+    def _close_delete_modal(self):
+        self.modal_active = False
+        dpg.configure_item("confirm_delete_modal", show=False)
+
     def _modal_confirm_delete_yes(self):
         """Acción cuando el usuario confirma la eliminación del clip."""
-        dpg.configure_item("confirm_delete_modal", show=False)
+        self._close_delete_modal()
         if self.target_delete_clip:
             self.eliminar_clip_uc.ejecutar(self.proyecto, self.target_delete_clip.id)
+            
+            # Borrar la miniatura física si existe
+            thumb_path = os.path.join(self.temp_thumbs_dir, f"clip_{self.target_delete_clip.id}.jpg")
+            if os.path.exists(thumb_path):
+                try:
+                    os.remove(thumb_path)
+                except Exception:
+                    pass
+            
+            # Borrar textura registrada
+            tex_tag = f"clip_thumb_tex_{self.target_delete_clip.id}"
+            if dpg.does_item_exist(tex_tag):
+                dpg.delete_item(tex_tag)
+
             dpg.set_value("status_bar", f"Eliminado: {self.target_delete_clip.name}")
             self.target_delete_clip = None
             self._rebuild_clip_list_ui()
@@ -585,15 +710,8 @@ class VideoEditorApp:
 
         dpg.set_value("status_bar", f"Exportando {clip.name}...")
         
-        # Ejecutar caso de uso
+        # Ejecutar caso de uso asíncrono
         try:
-            self.exportar_clip_uc.ejecutar(
-                video_path=self.proyecto.video.filepath,
-                clip=clip,
-                output_path=dest_path
-            )
-            # Nota: la notificación final se hará mediante los callbacks del procesador
-            # que interceptan el hilo secundario
             self.processor.cortar_clip(
                 video_path=self.proyecto.video.filepath,
                 start=clip.start_seconds,
@@ -624,7 +742,8 @@ class VideoEditorApp:
         if not output_dir:
             return
 
-        # Mostrar ventana modal de progreso
+        # Mostrar ventana modal de progreso y activar bloqueo de atajos
+        self.modal_active = True
         dpg.configure_item("progress_modal", show=True)
         dpg.set_value("progress_modal_bar", 0.0)
         dpg.set_value("progress_modal_text", "Preparando cola de corte...")
@@ -635,7 +754,6 @@ class VideoEditorApp:
         def worker_cola():
             errors = []
             for i, clip in enumerate(self.proyecto.clips):
-                # Actualizar texto del modal
                 dpg.set_value("progress_modal_text", f"Procesando clip {i+1} de {total_clips}:\n'{clip.name}'")
                 
                 _, ext = os.path.splitext(self.proyecto.video.filepath)
@@ -670,7 +788,8 @@ class VideoEditorApp:
                 progress = (i + 1) / total_clips
                 dpg.set_value("progress_modal_bar", progress)
 
-            # Finalizar
+            # Finalizar y desbloquear atajos
+            self.modal_active = False
             dpg.configure_item("progress_modal", show=False)
             if errors:
                 error_summary = "\n".join(errors)
@@ -683,11 +802,10 @@ class VideoEditorApp:
                 messagebox.showinfo("Exportación Completa", f"Se han exportado los {total_clips} clips exitosamente.")
                 root_box.destroy()
 
-        import threading
         t = threading.Thread(target=worker_cola, daemon=True)
         t.start()
 
-    # --- Persistencia de Sesión (Menú Archivo) ---
+    # --- Persistencia de Sesión ---
 
     def _menu_abrir_video(self):
         root = tk.Tk()
@@ -764,7 +882,85 @@ class VideoEditorApp:
             except Exception as e:
                 self._show_error(f"Error al cargar proyecto: {str(e)}")
 
-    # --- Utilidades y Diálogos de Alerta ---
+    # --- Métodos de Extracción de Miniaturas en Segundo Plano ---
+
+    def _generate_timeline_thumbnails(self, video_path: str):
+        """Extrae 8 imágenes de previsualización en segundo plano usando FFmpeg."""
+        try:
+            duration = self.total_duration
+            if duration <= 0.0:
+                return
+
+            self.thumbs_to_load.clear()
+
+            for i in range(8):
+                # Calcular marcas de tiempo intermedias
+                timestamp = i * (duration / 8.0) + (duration / 16.0)
+                timestamp = min(timestamp, duration - 0.1)
+
+                thumb_path = os.path.join(self.temp_thumbs_dir, f"thumb_{i}.jpg")
+
+                # Comando FFmpeg para extraer fotograma escalado y rápido
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-ss", f"{timestamp:.3f}",
+                    "-i", video_path,
+                    "-vframes", "1",
+                    "-q:v", "5",  # calidad media para acelerar
+                    "-vf", "scale=160:90",
+                    thumb_path
+                ]
+
+                # Ocultar consola cmd de fondo
+                startupinfo = None
+                if os.name == 'nt':
+                    startupinfo = subprocess.STARTUPINFO()
+                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    startupinfo.wShowWindow = subprocess.SW_HIDE
+
+                # Ejecutar FFmpeg
+                subprocess.run(cmd, startupinfo=startupinfo, capture_output=True)
+
+                if os.path.exists(thumb_path):
+                    self.thumbs_to_load.append((thumb_path, i))
+
+        except Exception as e:
+            print(f"Error al generar miniaturas de línea de tiempo: {e}")
+
+    def _generate_clip_thumbnail(self, clip: Clip):
+        """Extrae un fotograma representativo del inicio del clip en segundo plano."""
+        try:
+            if not self.proyecto.video:
+                return
+
+            thumb_path = os.path.join(self.temp_thumbs_dir, f"clip_{clip.id}.jpg")
+
+            # Buscar frame al inicio del clip y escalarlo
+            cmd = [
+                "ffmpeg", "-y",
+                "-ss", f"{clip.start_seconds:.3f}",
+                "-i", self.proyecto.video.filepath,
+                "-vframes", "1",
+                "-q:v", "4",
+                "-vf", "scale=120:68",
+                thumb_path
+            ]
+
+            startupinfo = None
+            if os.name == 'nt':
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = subprocess.SW_HIDE
+
+            subprocess.run(cmd, startupinfo=startupinfo, capture_output=True)
+
+            if os.path.exists(thumb_path):
+                self.clip_thumbs_to_load.append((clip.id, thumb_path))
+
+        except Exception as e:
+            print(f"Error al generar miniatura para clip individual: {e}")
+
+    # --- Utilidades ---
 
     def _show_error(self, message: str):
         """Muestra una alerta nativa de Windows en primer plano."""

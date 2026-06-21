@@ -54,6 +54,9 @@ class MPVPlayer(VideoPlayerInterface):
 
         self.logger.info(f"Subventana Win32 creada con HWND: {self.child_hwnd}")
 
+        # Deshabilitar la ventana para evitar capturar el foco de teclado
+        win32gui.EnableWindow(self.child_hwnd, False)
+
         # Inicializar el reproductor MPV pasándole el WID (Window ID) de nuestra subventana
         self.player = mpv.MPV(
             wid=str(self.child_hwnd),
